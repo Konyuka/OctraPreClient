@@ -23,13 +23,6 @@ stop_flag = threading.Event()
 spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 spinner_idx = 0
 
-# --- Automation Config ---
-DAILY_RECIPIENT = "oct3Q4psmryL1khLfMfNi2AJ9wLiHULxtYVQNr7YsdSeYW8"
-DAILY_AMOUNT = 0.01
-MAX_TOTAL_SENT = 1.0
-AUTOMATION_STATE_FILE = "automation_state.json"
-# -------------------------
-
 def cls():
     os.system('cls' if os.name == 'nt' else 'clear')
 
@@ -73,197 +66,6 @@ async def awaitkey():
         await asyncio.get_event_loop().run_in_executor(executor, input)
     except:
         stop_flag.set()
-
-def load_automation_state():
-    """Load automation state from file"""
-    try:
-        if os.path.exists(AUTOMATION_STATE_FILE):
-            with open(AUTOMATION_STATE_FILE, 'r') as f:
-                return json.load(f)
-    except:
-        pass
-    return {
-        'total_sent': 0.0,
-        'last_send_date': None,
-        'last_claim_check': None
-    }
-
-def save_automation_state(state):
-    """Save automation state to file"""
-    try:
-        with open(AUTOMATION_STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
-    except Exception as e:
-        print(f"{c['R']}Error saving automation state: {e}{c['r']}")
-
-async def daily_transfer_task():
-    """Daily automatic transfer task"""
-    while not stop_flag.is_set():
-        try:
-            state = load_automation_state()
-            today = datetime.now().strftime('%Y-%m-%d')
-            
-            # Check if we should send today
-            should_send = (
-                state['last_send_date'] != today and
-                state['total_sent'] < MAX_TOTAL_SENT
-            )
-            
-            if should_send:
-                print(f"\n{c['g']}[{datetime.now()}] Starting daily transfer...{c['r']}")
-                
-                # Check balance
-                n, b = await st()
-                if n is None:
-                    print(f"{c['R']}[{datetime.now()}] Failed to get wallet state{c['r']}")
-                elif not b or b < DAILY_AMOUNT:
-                    print(f"{c['R']}[{datetime.now()}] Insufficient balance! ({b:.6f} < {DAILY_AMOUNT}){c['r']}")
-                else:
-                    # Send transaction
-                    t, _ = mk(DAILY_RECIPIENT, DAILY_AMOUNT, n + 1)
-                    ok, hs, dt, r = await snd(t)
-                    
-                    if ok:
-                        print(f"{c['g']}[{datetime.now()}] ✓ Daily transfer successful!{c['r']}")
-                        print(f"  Amount: {DAILY_AMOUNT} OCT")
-                        print(f"  To: {DAILY_RECIPIENT}")
-                        print(f"  Hash: {hs}")
-                        print(f"  Time: {dt:.2f}s")
-                        
-                        # Update state
-                        state['total_sent'] += DAILY_AMOUNT
-                        state['last_send_date'] = today
-                        save_automation_state(state)
-                        
-                        # Add to history
-                        h.append({
-                            'time': datetime.now(),
-                            'hash': hs,
-                            'amt': DAILY_AMOUNT,
-                            'to': DAILY_RECIPIENT,
-                            'type': 'out',
-                            'ok': True,
-                            'msg': 'Daily automated transfer'
-                        })
-                        
-                        print(f"  Total sent so far: {state['total_sent']:.6f} OCT / {MAX_TOTAL_SENT} OCT")
-                    else:
-                        print(f"{c['R']}[{datetime.now()}] ✗ Daily transfer failed: {hs}{c['r']}")
-            else:
-                if state['last_send_date'] == today:
-                    print(f"{c['y']}[{datetime.now()}] Daily transfer already sent today{c['r']}")
-                if state['total_sent'] >= MAX_TOTAL_SENT:
-                    print(f"{c['y']}[{datetime.now()}] Maximum total amount reached ({state['total_sent']:.6f} OCT){c['r']}")
-            
-            # Wait for next day (24 hours)
-            print(f"{c['c']}[{datetime.now()}] Daily transfer task sleeping for 24 hours...{c['r']}")
-            await asyncio.sleep(86400)  # 24 hours
-            
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"{c['R']}[{datetime.now()}] Daily transfer task error: {e}{c['r']}")
-            await asyncio.sleep(3600)  # Wait 1 hour on error
-
-async def auto_claim_task():
-    """Automatic claiming of pending transfers"""
-    while not stop_flag.is_set():
-        try:
-            print(f"\n{c['c']}[{datetime.now()}] Checking for pending transfers...{c['r']}")
-            
-            transfers = await get_pending_transfers()
-            
-            if transfers:
-                print(f"{c['g']}[{datetime.now()}] Found {len(transfers)} pending transfers{c['r']}")
-                
-                claimed_count = 0
-                total_claimed = 0
-                
-                for transfer in transfers:
-                    try:
-                        transfer_id = transfer['id']
-                        
-                        # Try to decrypt amount for display
-                        amount_str = "[encrypted]"
-                        if transfer.get('encrypted_data') and transfer.get('ephemeral_key'):
-                            try:
-                                shared = derive_shared_secret_for_claim(priv, transfer['ephemeral_key'])
-                                amt = decrypt_private_amount(transfer['encrypted_data'], shared)
-                                if amt:
-                                    amount_str = f"{amt/μ:.6f} OCT"
-                            except:
-                                pass
-                        
-                        print(f"  Claiming transfer #{transfer_id} ({amount_str}) from {transfer['sender'][:20]}...")
-                        
-                        ok, result = await claim_private_transfer(transfer_id)
-                        
-                        if ok:
-                            claimed_amount = result.get('amount', 'unknown')
-                            print(f"{c['g']}  ✓ Claimed {claimed_amount}{c['r']}")
-                            claimed_count += 1
-                            if isinstance(claimed_amount, (int, float)):
-                                total_claimed += claimed_amount
-                        else:
-                            error_msg = result.get('error', 'unknown error')
-                            print(f"{c['R']}  ✗ Failed to claim: {error_msg}{c['r']}")
-                        
-                        # Small delay between claims
-                        await asyncio.sleep(0.5)
-                        
-                    except Exception as e:
-                        print(f"{c['R']}  ✗ Error claiming transfer: {e}{c['r']}")
-                
-                if claimed_count > 0:
-                    print(f"{c['g']}[{datetime.now()}] Successfully claimed {claimed_count} transfers{c['r']}")
-                    if total_claimed > 0:
-                        print(f"  Total claimed: {total_claimed}")
-                else:
-                    print(f"{c['y']}[{datetime.now()}] No transfers were claimed{c['r']}")
-            else:
-                print(f"{c['y']}[{datetime.now()}] No pending transfers found{c['r']}")
-            
-            # Check every 30 minutes
-            print(f"{c['c']}[{datetime.now()}] Auto-claim task sleeping for 30 minutes...{c['r']}")
-            await asyncio.sleep(1800)  # 30 minutes
-            
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"{c['R']}[{datetime.now()}] Auto-claim task error: {e}{c['r']}")
-            await asyncio.sleep(600)  # Wait 10 minutes on error
-
-async def automation_main():
-    """Main automation function"""
-    print(f"{c['B']}{c['c']}--- Automation Mode ---{c['r']}")
-    print(f"{c['y']}Starting automated tasks. Press Ctrl+C to stop.{c['r']}")
-    
-    # Load and display current state
-    state = load_automation_state()
-    print(f"\nCurrent automation state:")
-    print(f"  Daily recipient: {DAILY_RECIPIENT}")
-    print(f"  Daily amount: {DAILY_AMOUNT} OCT")
-    print(f"  Total sent: {state['total_sent']:.6f} OCT / {MAX_TOTAL_SENT} OCT")
-    print(f"  Last send date: {state['last_send_date'] or 'Never'}")
-    print(f"  Remaining: {max(0, MAX_TOTAL_SENT - state['total_sent']):.6f} OCT")
-    print()
-    
-    # Initial state check
-    await st()
-    
-    # Start automation tasks
-    daily_task = asyncio.create_task(daily_transfer_task())
-    claim_task = asyncio.create_task(auto_claim_task())
-    
-    try:
-        await asyncio.gather(daily_task, claim_task)
-    except asyncio.CancelledError:
-        print(f"\n{c['y']}Automation tasks cancelled.{c['r']}")
-    except KeyboardInterrupt:
-        print(f"\n{c['y']}Automation stopped by user.{c['r']}")
-    finally:
-        daily_task.cancel()
-        claim_task.cancel()
 
 def ld():
     global priv, addr, rpc, sk, pub
@@ -782,9 +584,7 @@ def menu(x, y, w, h):
     at(x + 2, y + 8, "[7] claim transfers", c['w'])
     at(x + 2, y + 9, "[8] export keys", c['w'])
     at(x + 2, y + 10, "[9] clear hist", c['w'])
-    at(x + 2, y + 11, "[A] automate", c['B'] + c['g'])
-    at(x + 2, y + 12, "[S] auto status", c['c'])
-    at(x + 2, y + 13, "[0] exit", c['w'])
+    at(x + 2, y + 11, "[0] exit", c['w'])
     at(x + 2, y + h - 2, "command: ", c['B'] + c['y'])
 
 async def scr():
@@ -795,10 +595,10 @@ async def scr():
     at((cr[0] - len(t)) // 2, 1, t, c['B'] + c['w'])
     
     sidebar_w = 28
-    menu(2, 3, sidebar_w, 17)
+    menu(2, 3, sidebar_w, 15)
     
-    info_y = 21
-    box(2, info_y, sidebar_w, 9)
+    info_y = 19
+    box(2, info_y, sidebar_w, 11)
     at(4, info_y + 2, "testnet environment.", c['y'])
     at(4, info_y + 3, "actively updated.", c['y'])
     at(4, info_y + 4, "monitor changes!", c['y'])
@@ -806,17 +606,7 @@ async def scr():
     at(4, info_y + 6, "private transactions", c['g'])
     at(4, info_y + 7, "enabled", c['g'])
     at(4, info_y + 8, "", c['y'])
-    
-    # Show automation status
-    try:
-        state = load_automation_state()
-        remaining = max(0, MAX_TOTAL_SENT - state['total_sent'])
-        if remaining > 0:
-            at(4, info_y + 9, f"auto: {remaining:.2f} oct left", c['c'])
-        else:
-            at(4, info_y + 9, "auto: limit reached", c['R'])
-    except:
-        at(4, info_y + 9, "tokens: no value", c['R'])
+    at(4, info_y + 9, "tokens: no value", c['R'])
     
     explorer_x = sidebar_w + 4
     explorer_w = cr[0] - explorer_x - 2
@@ -824,7 +614,7 @@ async def scr():
     
     at(2, cr[1] - 1, " " * (cr[0] - 4), c['bg'])
     at(2, cr[1] - 1, "ready", c['bgg'] + c['w'])
-    return await ainp(12, 18)
+    return await ainp(12, 16)
 
 async def tx():
     cr = sz()
@@ -1359,56 +1149,6 @@ async def claim_transfers_ui():
     
     await awaitkey()
 
-async def show_automation_status():
-    """Show detailed automation status"""
-    cr = sz()
-    cls()
-    fill()
-    w, hb = 70, 20
-    x = (cr[0] - w) // 2
-    y = (cr[1] - hb) // 2
-    
-    box(x, y, w, hb, "automation status")
-    
-    state = load_automation_state()
-    
-    at(x + 2, y + 2, "Daily Transfer Settings:", c['B'] + c['c'])
-    at(x + 2, y + 3, f"Recipient: {DAILY_RECIPIENT}", c['w'])
-    at(x + 2, y + 4, f"Amount per day: {DAILY_AMOUNT} OCT", c['w'])
-    at(x + 2, y + 5, f"Maximum total: {MAX_TOTAL_SENT} OCT", c['w'])
-    
-    at(x + 2, y + 7, "Current Status:", c['B'] + c['c'])
-    at(x + 2, y + 8, f"Total sent: {state['total_sent']:.6f} OCT", c['g' if state['total_sent'] < MAX_TOTAL_SENT else 'R'])
-    at(x + 2, y + 9, f"Remaining: {max(0, MAX_TOTAL_SENT - state['total_sent']):.6f} OCT", c['y'])
-    at(x + 2, y + 10, f"Last send: {state['last_send_date'] or 'Never'}", c['w'])
-    
-    # Check if we can send today
-    today = datetime.now().strftime('%Y-%m-%d')
-    can_send_today = (state['last_send_date'] != today and state['total_sent'] < MAX_TOTAL_SENT)
-    
-    at(x + 2, y + 11, f"Can send today: {'Yes' if can_send_today else 'No'}", c['g'] if can_send_today else c['R'])
-    
-    at(x + 2, y + 13, "Auto-claim Settings:", c['B'] + c['c'])
-    at(x + 2, y + 14, "Checks every 30 minutes", c['w'])
-    at(x + 2, y + 15, "Claims all pending transfers", c['w'])
-    
-    at(x + 2, y + 17, "Press [R] to reset automation state or [Enter] to continue", c['y'])
-    
-    choice = await ainp(x + 2, y + 18)
-    
-    if choice.lower() == 'r':
-        at(x + 2, y + 17, "Are you sure? This will reset the total sent counter [y/N]:", c['R'])
-        confirm = await ainp(x + 55, y + 17)
-        if confirm.lower() == 'y':
-            reset_state = {
-                'total_sent': 0.0,
-                'last_send_date': None,
-                'last_claim_check': None
-            }
-            save_automation_state(reset_state)
-            at(x + 2, y + 18, "Automation state reset!", c['g'])
-            await asyncio.sleep(1)
-
 async def exp():
     cr = sz()
     cls()
@@ -1529,15 +1269,6 @@ async def main():
             elif cmd == '9':
                 h.clear()
                 lh = 0
-            elif cmd.lower() == 'a':
-                cls()
-                fill()
-                await automation_main()
-                # After automation is stopped, give a moment before returning to menu
-                print(f"\n{c['y']}Returning to main menu in 3 seconds...{c['r']}")
-                await asyncio.sleep(3)
-            elif cmd.lower() == 's':
-                await show_automation_status()
             elif cmd in ['0', 'q', '']:
                 break
     except Exception:
