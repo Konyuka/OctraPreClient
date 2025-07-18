@@ -34,12 +34,6 @@ auto_addresses = [
     'oct8JSKwc66sSYfA484ortpZC8GKmmd5YcZQSctMRVvs3Z2',
     'oct3EABVwSfXNg9dF5wWjU9enftZXovmdonbydA1yKdhEL5',
     'octGwk1keKx7x2S6A5vRqxxUW6jDUHYQJ8ZFf25PkqNjcp7',
-    'octEbFzyayC4bSaPdG29bn3uqM7UxHBLUCDgQqxuASjvMBW',
-    'octCTzLvKrxPXNGyWZeBAiEiE8UN7DXe2eGJVgdPYimKog5',
-    'octEggobi1U8AjJUPUye6P5nN7YwPUvohzJAf5TLeJTjWeU',
-    'octGHPkxysJ4vStwSH8nenokGACabo8vqjwFSWZMLG78DSt',
-    'oct6ofsKuhbFADd5yVxtJrCKFv6ZhWsYcneD5aHUGyq5CTo',
-    'octJBwmZNUjnffikWPYa2BmicP1x98JoSML6LMR3XScHgk7'
 ]
 auto_stats = {
     'send_tx': {'count': 0, 'last': None, 'next_idx': 0, 'errors': 0},
