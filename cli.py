@@ -33,7 +33,13 @@ auto_addresses = [
     'oct9sqLw4w4mrxvuSk92YikPTiE4gzRaKJvBU5owRAChNPn',
     'oct8JSKwc66sSYfA484ortpZC8GKmmd5YcZQSctMRVvs3Z2',
     'oct3EABVwSfXNg9dF5wWjU9enftZXovmdonbydA1yKdhEL5',
-    'octGwk1keKx7x2S6A5vRqxxUW6jDUHYQJ8ZFf25PkqNjcp7'
+    'octGwk1keKx7x2S6A5vRqxxUW6jDUHYQJ8ZFf25PkqNjcp7',
+    'octEbFzyayC4bSaPdG29bn3uqM7UxHBLUCDgQqxuASjvMBW',
+    'octCTzLvKrxPXNGyWZeBAiEiE8UN7DXe2eGJVgdPYimKog5',
+    'octEggobi1U8AjJUPUye6P5nN7YwPUvohzJAf5TLeJTjWeU',
+    'octGHPkxysJ4vStwSH8nenokGACabo8vqjwFSWZMLG78DSt',
+    'oct6ofsKuhbFADd5yVxtJrCKFv6ZhWsYcneD5aHUGyq5CTo',
+    'octJBwmZNUjnffikWPYa2BmicP1x98JoSML6LMR3XScHgk7'
 ]
 auto_stats = {
     'send_tx': {'count': 0, 'last': None, 'next_idx': 0, 'errors': 0},
@@ -1408,11 +1414,13 @@ async def get_next_nonce():
         if current_nonce is None:
             return None
         
-        # Ensure we don't reuse a nonce
-        if last_used_nonce is not None and current_nonce <= last_used_nonce:
-            next_nonce = last_used_nonce + 1
-        else:
+        # For the first transaction, use current_nonce + 1
+        # For subsequent transactions, increment from last_used_nonce
+        if last_used_nonce is None:
             next_nonce = current_nonce + 1
+        else:
+            # Only increment if we're ahead of the server nonce
+            next_nonce = max(current_nonce + 1, last_used_nonce + 1)
         
         last_used_nonce = next_nonce
         log_info(f"Allocated nonce {next_nonce} (current: {current_nonce}, last_used: {last_used_nonce})")
@@ -1553,6 +1561,10 @@ async def auto_multi_send():
                     try:
                         log_info(f"Auto Multi Send: Sending 0.01 to address {i + 1}/{len(auto_addresses)} ({target_addr})")
                         
+                        # Small delay between transactions to avoid nonce conflicts
+                        if i > 0:
+                            await asyncio.sleep(2)
+                        
                         # Send transaction with retry logic
                         ok, hs, dt, r = await send_with_retry(target_addr, 0.01, "auto_multi", max_retries=3)
                         
@@ -1605,6 +1617,7 @@ async def auto_multi_send():
 async def auto_private_transfer():
     """Private transfer 0.1 token to addresses in round robin every 5 minutes"""
     log_info("Auto private transfer started")
+    consecutive_duplicates = 0
     try:
         while not auto_stop_flag.is_set():
             try:
@@ -1621,11 +1634,15 @@ async def auto_private_transfer():
                     await asyncio.sleep(300)  # 5 minutes
                     continue
                 
+                # Small delay to avoid rapid succession
+                await asyncio.sleep(1)
+                
                 # Create private transfer
                 ok, result = await create_private_transfer(target_addr, 0.1)
                 log_info(f"Auto private transfer: transfer result - ok: {ok}, result: {result}")
                 
                 if ok:
+                    consecutive_duplicates = 0  # Reset counter on success
                     auto_stats['private_transfer']['count'] += 1
                     auto_stats['private_transfer']['last'] = datetime.now()
                     auto_stats['private_transfer']['next_idx'] = (auto_stats['private_transfer']['next_idx'] + 1) % len(auto_addresses)
@@ -1633,9 +1650,16 @@ async def auto_private_transfer():
                 else:
                     # Check if it's a duplicate transaction error
                     if result and is_duplicate_transaction_error(result.get('error', '')):
-                        log_info(f"Auto private transfer: skipped duplicate transaction to {target_addr}")
-                        # Don't count duplicates as errors
+                        consecutive_duplicates += 1
+                        log_info(f"Auto private transfer: skipped duplicate transaction to {target_addr} (consecutive: {consecutive_duplicates})")
+                        
+                        # If we get too many consecutive duplicates, move to next address
+                        if consecutive_duplicates >= 3:
+                            log_warning(f"Auto private transfer: too many consecutive duplicates, moving to next address")
+                            auto_stats['private_transfer']['next_idx'] = (auto_stats['private_transfer']['next_idx'] + 1) % len(auto_addresses)
+                            consecutive_duplicates = 0
                     else:
+                        consecutive_duplicates = 0  # Reset on non-duplicate error
                         auto_stats['private_transfer']['errors'] += 1
                         log_error("auto_private_transfer", Exception(f"Transfer failed: {result}"), f"Failed to transfer to {target_addr}")
                     
@@ -1788,6 +1812,10 @@ async def start_auto_mode():
         print("Starting auto mode...")
         auto_mode = True
         auto_stop_flag.clear()
+        
+        # Reset nonce counter to avoid stale state
+        global last_used_nonce
+        last_used_nonce = None
         
         # Reset statistics for a fresh start
         reset_auto_stats()
