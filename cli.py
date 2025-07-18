@@ -8,6 +8,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import hmac
 import ssl
 import signal
+import logging
+import traceback
 
 c = {'r': '\033[0m', 'b': '\033[34m', 'c': '\033[36m', 'g': '\033[32m', 'y': '\033[33m', 'R': '\033[31m', 'B': '\033[1m', 'bg': '\033[44m', 'bgr': '\033[41m', 'bgg': '\033[42m', 'w': '\033[37m'}
 
@@ -22,6 +24,30 @@ executor = ThreadPoolExecutor(max_workers=1)
 stop_flag = threading.Event()
 spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 spinner_idx = 0
+
+# Auto mode variables
+auto_mode = False
+auto_stop_flag = threading.Event()
+auto_addresses = [
+    'octFmfT2tdqoXx1C9xJ83HM78Nc4hZbkahfcQrEwXBogqpb',
+    'oct9sqLw4w4mrxvuSk92YikPTiE4gzRaKJvBU5owRAChNPn',
+    'oct8JSKwc66sSYfA484ortpZC8GKmmd5YcZQSctMRVvs3Z2',
+    'oct3EABVwSfXNg9dF5wWjU9enftZXovmdonbydA1yKdhEL5',
+    'octGwk1keKx7x2S6A5vRqxxUW6jDUHYQJ8ZFf25PkqNjcp7'
+]
+auto_stats = {
+    'send_tx': {'count': 0, 'last': None, 'next_idx': 0, 'errors': 0},
+    'multi_send': {'count': 0, 'last': None, 'errors': 0},
+    'private_transfer': {'count': 0, 'last': None, 'next_idx': 0, 'errors': 0},
+    'encrypt_balance': {'count': 0, 'last': None, 'errors': 0},
+    'decrypt_balance': {'count': 0, 'last': None, 'errors': 0},
+    'auto_claim': {'count': 0, 'last': None, 'errors': 0}
+}
+auto_tasks = []
+
+# Nonce management for auto mode to prevent duplicate transactions
+nonce_lock = asyncio.Lock()
+last_used_nonce = None
 
 def cls():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -108,6 +134,37 @@ def box(x, y, w, h, t=""):
     for i in range(1, h - 1):
         print(f"\033[{y + i};{x}H{c['bg']}{c['w']}│{' ' * (w - 2)}│{c['bg']}")
     print(f"\033[{y + h - 1};{x}H{c['bg']}{c['w']}└{'─' * (w - 2)}┘{c['bg']}")
+
+def format_time_ago(dt):
+    """Format time ago string"""
+    if not dt:
+        return "never"
+    
+    diff = datetime.now() - dt
+    seconds = int(diff.total_seconds())
+    
+    if seconds < 60:
+        return f"{seconds}s ago"
+    elif seconds < 3600:
+        return f"{seconds//60}m ago"
+    else:
+        return f"{seconds//3600}h ago"
+
+def format_next_action(last_time, interval_seconds):
+    """Format next action time"""
+    if not last_time:
+        return "starting..."
+    
+    next_time = last_time + timedelta(seconds=interval_seconds)
+    diff = next_time - datetime.now()
+    seconds = int(diff.total_seconds())
+    
+    if seconds <= 0:
+        return "now"
+    elif seconds < 60:
+        return f"{seconds}s"
+    else:
+        return f"{seconds//60}m {seconds%60}s"
 
 async def spin_animation(x, y, msg):
     global spinner_idx
@@ -319,9 +376,11 @@ async def get_encrypted_balance():
                 "encrypted_raw": int(result.get("encrypted_balance_raw", "0")),
                 "total": float(result.get("total_balance", "0").split()[0])
             }
-        except:
+        except Exception as e:
+            log_warning(f"Error parsing encrypted balance data: {str(e)}, raw result: {result}")
             return None
     else:
+        log_warning(f"Failed to get encrypted balance: {result}")
         return None
 
 async def encrypt_balance(amount):
@@ -334,11 +393,15 @@ async def encrypt_balance(amount):
     
     encrypted_value = encrypt_client_balance(new_encrypted_raw, priv)
     
+    # Add timestamp to prevent duplicate detection
+    timestamp = str(int(time.time() * 1000000))  # microsecond timestamp
+    
     data = {
         "address": addr,
         "amount": str(int(amount * μ)),
         "private_key": priv,
-        "encrypted_data": encrypted_value
+        "encrypted_data": encrypted_value,
+        "timestamp": timestamp
     }
     
     s, t, j = await req('POST', '/encrypt_balance', data)
@@ -360,11 +423,15 @@ async def decrypt_balance(amount):
     
     encrypted_value = encrypt_client_balance(new_encrypted_raw, priv)
     
+    # Add timestamp to prevent duplicate detection
+    timestamp = str(int(time.time() * 1000000))  # microsecond timestamp
+    
     data = {
         "address": addr,
         "amount": str(int(amount * μ)),
         "private_key": priv,
-        "encrypted_data": encrypted_value
+        "encrypted_data": encrypted_value,
+        "timestamp": timestamp
     }
     
     s, t, j = await req('POST', '/decrypt_balance', data)
@@ -394,12 +461,16 @@ async def create_private_transfer(to_addr, amount):
     if not to_public_key:
         return False, {"error": "Cannot get recipient public key"}
     
+    # Add timestamp to prevent duplicate detection
+    timestamp = str(int(time.time() * 1000000))  # microsecond timestamp
+    
     data = {
         "from": addr,
         "to": to_addr,
         "amount": str(int(amount * μ)),
         "from_private_key": priv,
-        "to_public_key": to_public_key
+        "to_public_key": to_public_key,
+        "timestamp": timestamp
     }
     
     s, t, j = await req('POST', '/private_transfer', data)
@@ -584,7 +655,14 @@ def menu(x, y, w, h):
     at(x + 2, y + 8, "[7] claim transfers", c['w'])
     at(x + 2, y + 9, "[8] export keys", c['w'])
     at(x + 2, y + 10, "[9] clear hist", c['w'])
-    at(x + 2, y + 11, "[0] exit", c['w'])
+    
+    # Auto mode toggle
+    auto_text = "stop auto" if auto_mode else "start auto"
+    auto_color = c['R'] if auto_mode else c['g']
+    at(x + 2, y + 11, f"[a] {auto_text}", auto_color)
+    
+    at(x + 2, y + 12, "[s] auto status", c['c'])
+    at(x + 2, y + 13, "[0] exit", c['w'])
     at(x + 2, y + h - 2, "command: ", c['B'] + c['y'])
 
 async def scr():
@@ -595,18 +673,48 @@ async def scr():
     at((cr[0] - len(t)) // 2, 1, t, c['B'] + c['w'])
     
     sidebar_w = 28
-    menu(2, 3, sidebar_w, 15)
+    menu(2, 3, sidebar_w, 16)  # Increased height for new options
     
-    info_y = 19
-    box(2, info_y, sidebar_w, 11)
-    at(4, info_y + 2, "testnet environment.", c['y'])
-    at(4, info_y + 3, "actively updated.", c['y'])
-    at(4, info_y + 4, "monitor changes!", c['y'])
-    at(4, info_y + 5, "", c['y'])
-    at(4, info_y + 6, "private transactions", c['g'])
-    at(4, info_y + 7, "enabled", c['g'])
-    at(4, info_y + 8, "", c['y'])
-    at(4, info_y + 9, "tokens: no value", c['R'])
+    info_y = 20  # Moved down by 1 to accommodate larger menu
+    info_h = 11
+    
+    if auto_mode:
+        # Show auto mode status instead of static info
+        box(2, info_y, sidebar_w, info_h, "auto mode status")
+        
+        # Auto mode indicator
+        at(4, info_y + 2, "AUTO MODE ACTIVE", c['bgg'] + c['w'])
+        
+        # Send TX status
+        at(4, info_y + 3, f"send tx: {auto_stats['send_tx']['count']} sent", c['g'] if auto_stats['send_tx']['count'] > 0 else c['w'])
+        at(4, info_y + 4, f"  next: {format_next_action(auto_stats['send_tx']['last'], 60)}", c['c'])
+        
+        # Multi send status
+        at(4, info_y + 5, f"multi: {auto_stats['multi_send']['count']} sent", c['g'] if auto_stats['multi_send']['count'] > 0 else c['w'])
+        at(4, info_y + 6, f"  next: {format_next_action(auto_stats['multi_send']['last'], 300)}", c['c'])
+        
+        # Private transfer status
+        at(4, info_y + 7, f"private: {auto_stats['private_transfer']['count']} sent", c['g'] if auto_stats['private_transfer']['count'] > 0 else c['w'])
+        
+        # Encrypt/decrypt status
+        encrypt_count = auto_stats['encrypt_balance']['count']
+        decrypt_count = auto_stats['decrypt_balance']['count']
+        at(4, info_y + 8, f"encrypt: {encrypt_count}/{decrypt_count}", c['y'])
+        
+        # Claim status
+        at(4, info_y + 9, f"claimed: {auto_stats['auto_claim']['count']}", c['g'] if auto_stats['auto_claim']['count'] > 0 else c['w'])
+        
+    else:
+        # Show static info when auto mode is off
+        box(2, info_y, sidebar_w, info_h)
+        at(4, info_y + 2, "testnet environment.", c['y'])
+        at(4, info_y + 3, "actively updated.", c['y'])
+        at(4, info_y + 4, "monitor changes!", c['y'])
+        at(4, info_y + 5, "", c['y'])
+        at(4, info_y + 6, "private transactions", c['g'])
+        at(4, info_y + 7, "enabled", c['g'])
+        at(4, info_y + 8, "", c['y'])
+        at(4, info_y + 9, "tokens: no value", c['R'])
     
     explorer_x = sidebar_w + 4
     explorer_w = cr[0] - explorer_x - 2
@@ -614,7 +722,7 @@ async def scr():
     
     at(2, cr[1] - 1, " " * (cr[0] - 4), c['bg'])
     at(2, cr[1] - 1, "ready", c['bgg'] + c['w'])
-    return await ainp(12, 16)
+    return await ainp(12, 17)  # Adjusted for new menu height
 
 async def tx():
     cr = sz()
@@ -1223,8 +1331,606 @@ async def exp():
         at(x + 2, y + 11, " " * (w - 4), c['bg'])
         await awaitkey()
 
+# Setup logging
+def setup_logging():
+    """Setup logging to file with rotation"""
+    log_filename = f"octra_auto_mode_{datetime.now().strftime('%Y%m%d')}.log"
+    
+    # Create a custom logger
+    logger = logging.getLogger('octra_auto')
+    logger.setLevel(logging.DEBUG)
+    
+    # Clear any existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # Create file handler
+    file_handler = logging.FileHandler(log_filename, mode='a', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    
+    # Create console handler for critical errors
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.ERROR)
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+# Initialize logger
+logger = setup_logging()
+
+def log_error(func_name, error, additional_info=""):
+    """Log error with full traceback"""
+    error_msg = f"Error in {func_name}: {str(error)}"
+    if additional_info:
+        error_msg += f" | {additional_info}"
+    
+    logger.error(error_msg)
+    logger.error("Full traceback:")
+    logger.error(traceback.format_exc())
+
+def log_info(message):
+    """Log info message"""
+    logger.info(message)
+
+def log_warning(message):
+    """Log warning message"""
+    logger.warning(message)
+
+def reset_auto_stats():
+    """Reset auto mode statistics for a fresh start"""
+    global auto_stats
+    for key in auto_stats:
+        auto_stats[key]['count'] = 0
+        auto_stats[key]['errors'] = 0
+        auto_stats[key]['last'] = None
+        if 'next_idx' in auto_stats[key]:
+            auto_stats[key]['next_idx'] = 0
+    log_info("Auto mode statistics reset")
+
+# Helper functions for auto mode transaction management
+async def get_next_nonce():
+    """Get the next available nonce with proper locking to prevent duplicates"""
+    global last_used_nonce
+    async with nonce_lock:
+        current_nonce, _ = await st()
+        if current_nonce is None:
+            return None
+        
+        # Ensure we don't reuse a nonce
+        if last_used_nonce is not None and current_nonce <= last_used_nonce:
+            next_nonce = last_used_nonce + 1
+        else:
+            next_nonce = current_nonce + 1
+        
+        last_used_nonce = next_nonce
+        log_info(f"Allocated nonce {next_nonce} (current: {current_nonce}, last_used: {last_used_nonce})")
+        return next_nonce
+
+def is_duplicate_transaction_error(error_msg):
+    """Check if the error is a duplicate transaction error"""
+    if not error_msg:
+        return False
+    error_str = str(error_msg).lower()
+    return ('duplicate' in error_str and 'transaction' in error_str) or 'duplicate transaction' in error_str
+
+async def send_with_retry(target_addr, amount, tx_type, max_retries=3):
+    """Send transaction with retry logic for duplicate transaction errors"""
+    for attempt in range(max_retries):
+        try:
+            # Get fresh nonce for each attempt
+            nonce = await get_next_nonce()
+            if nonce is None:
+                return False, "Failed to get nonce", None, None
+            
+            # Create and send transaction
+            tx, tx_hash = mk(target_addr, amount, nonce, tx_type)
+            ok, hs, dt, r = await snd(tx)
+            
+            if ok:
+                log_info(f"Transaction successful on attempt {attempt + 1}: {hs}")
+                return ok, hs, dt, r
+            else:
+                # Check if it's a duplicate transaction error
+                if is_duplicate_transaction_error(hs):
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
+                        log_warning(f"Duplicate transaction detected on attempt {attempt + 1}, retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        log_warning(f"Duplicate transaction error persisted after {max_retries} attempts, skipping...")
+                        return False, f"Duplicate transaction after {max_retries} retries", dt, r
+                else:
+                    # Other error, don't retry
+                    log_error("send_with_retry", f"Transaction failed with non-duplicate error: {hs}")
+                    return ok, hs, dt, r
+                    
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2
+                log_warning(f"Transaction attempt {attempt + 1} failed with exception, retrying in {wait_time}s: {str(e)}")
+                await asyncio.sleep(wait_time)
+            else:
+                log_error("send_with_retry", f"Transaction failed after {max_retries} attempts: {str(e)}")
+                return False, str(e), None, None
+    
+    return False, "Max retries exceeded", None, None
+
+# Auto mode functions
+async def auto_send_tx():
+    """Send 0.01 token to addresses in round robin every minute"""
+    log_info("Auto Send TX task started")
+    # Start immediately (no delay)
+    try:
+        while not auto_stop_flag.is_set():
+            try:
+                target_addr = auto_addresses[auto_stats['send_tx']['next_idx']]
+                log_info(f"Auto Send TX: Attempting to send 0.01 to {target_addr}")
+                
+                # Check balance first
+                _, b = await st()
+                if b is None or b < 0.01:
+                    auto_stats['send_tx']['errors'] += 1
+                    log_warning(f"Auto Send TX: Insufficient balance ({b})")
+                    await asyncio.sleep(60)
+                    continue
+                
+                # Send transaction with retry logic
+                ok, hs, dt, r = await send_with_retry(target_addr, 0.01, "auto_send", max_retries=3)
+                
+                if ok:
+                    auto_stats['send_tx']['count'] += 1
+                    auto_stats['send_tx']['last'] = datetime.now()
+                    auto_stats['send_tx']['next_idx'] = (auto_stats['send_tx']['next_idx'] + 1) % len(auto_addresses)
+                    log_info(f"Auto Send TX: Successfully sent 0.01 to {target_addr}, hash: {hs}")
+                    
+                    # Add to history
+                    h.append({
+                        'time': datetime.now(),
+                        'hash': hs,
+                        'amt': 0.01,
+                        'to': target_addr,
+                        'type': 'out',
+                        'ok': True,
+                        'msg': 'auto_send'
+                    })
+                else:
+                    auto_stats['send_tx']['errors'] += 1
+                    # Only log as error if it's not a duplicate transaction that we're skipping
+                    if not is_duplicate_transaction_error(hs):
+                        log_error("auto_send_tx", Exception(f"Transaction failed: {hs}"), f"Failed to send to {target_addr}")
+                    else:
+                        log_info(f"Auto Send TX: Skipped duplicate transaction to {target_addr}")
+                    
+            except Exception as e:
+                auto_stats['send_tx']['errors'] += 1
+                log_error("auto_send_tx", e, f"Exception in send loop for {target_addr}")
+            
+            # Wait 60 seconds
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        log_info("Auto Send TX task cancelled")
+    except Exception as e:
+        log_error("auto_send_tx", e, "Fatal error in auto_send_tx")
+
+async def auto_multi_send():
+    """Multi send 0.01 token to all addresses every 5 minutes"""
+    log_info("Auto Multi Send task started")
+    # Wait 10 seconds before starting to stagger with auto_send_tx
+    await asyncio.sleep(10)
+    log_info("Auto Multi Send: Starting after 10s delay")
+    try:
+        while not auto_stop_flag.is_set():
+            try:
+                log_info("Auto Multi Send: Starting cycle - sending 0.01 to all addresses")
+                
+                # Check balance first - we need at least 0.01 * number of addresses
+                _, b = await st()
+                required_balance = 0.01 * len(auto_addresses)
+                if b is None or b < required_balance:
+                    auto_stats['multi_send']['errors'] += 1
+                    log_warning(f"Auto Multi Send: Insufficient balance ({b}) - need {required_balance} for all addresses")
+                    await asyncio.sleep(300)  # 5 minutes
+                    continue
+                
+                # Send to all addresses in this cycle
+                all_success = True
+                successful_sends = 0
+                
+                for i, target_addr in enumerate(auto_addresses):
+                    try:
+                        log_info(f"Auto Multi Send: Sending 0.01 to address {i + 1}/{len(auto_addresses)} ({target_addr})")
+                        
+                        # Send transaction with retry logic
+                        ok, hs, dt, r = await send_with_retry(target_addr, 0.01, "auto_multi", max_retries=3)
+                        
+                        if ok:
+                            successful_sends += 1
+                            log_info(f"Auto Multi Send: Successfully sent 0.01 to {target_addr}, hash: {hs}")
+                            
+                            # Add to history
+                            h.append({
+                                'time': datetime.now(),
+                                'hash': hs,
+                                'amt': 0.01,
+                                'to': target_addr,
+                                'type': 'out',
+                                'ok': True,
+                                'msg': 'auto_multi'
+                            })
+                        else:
+                            all_success = False
+                            # Only log as error if it's not a duplicate transaction that we're skipping
+                            if not is_duplicate_transaction_error(hs):
+                                log_error("auto_multi_send", Exception(f"Transaction failed: {hs}"), f"Failed to send to {target_addr}")
+                            else:
+                                log_info(f"Auto Multi Send: Skipped duplicate transaction to {target_addr}")
+                        
+                    except Exception as e:
+                        all_success = False
+                        log_error("auto_multi_send", e, f"Exception sending to {target_addr}")
+                
+                # Update stats based on overall cycle success
+                if all_success:
+                    auto_stats['multi_send']['count'] += 1
+                    auto_stats['multi_send']['last'] = datetime.now()
+                    log_info(f"Auto Multi Send: Cycle completed successfully - sent to all {len(auto_addresses)} addresses")
+                else:
+                    auto_stats['multi_send']['errors'] += 1
+                    log_error("auto_multi_send", Exception("Partial cycle failure"), f"Cycle completed with errors - {successful_sends}/{len(auto_addresses)} successful")
+                    
+            except Exception as e:
+                auto_stats['multi_send']['errors'] += 1
+                log_error("auto_multi_send", e, "Exception in multi send cycle")
+            
+            # Wait 5 minutes
+            await asyncio.sleep(300)
+    except asyncio.CancelledError:
+        log_info("Auto Multi Send task cancelled")
+    except Exception as e:
+        log_error("auto_multi_send", e, "Fatal error in auto_multi_send")
+
+async def auto_private_transfer():
+    """Private transfer 0.1 token to addresses in round robin every 5 minutes"""
+    log_info("Auto private transfer started")
+    try:
+        while not auto_stop_flag.is_set():
+            try:
+                target_addr = auto_addresses[auto_stats['private_transfer']['next_idx']]
+                log_info(f"Auto private transfer: attempting transfer to {target_addr}")
+                
+                # Check encrypted balance
+                enc_data = await get_encrypted_balance()
+                log_info(f"Auto private transfer: retrieved encrypted balance data: {enc_data}")
+                if not enc_data or enc_data['encrypted'] < 0.1:
+                    log_warning(f"Auto private transfer: insufficient encrypted balance ({enc_data['encrypted'] if enc_data else 'N/A'})")
+                    # Don't count insufficient balance as an error, just skip this cycle
+                    log_info("Auto private transfer: waiting 5 minutes before next attempt")
+                    await asyncio.sleep(300)  # 5 minutes
+                    continue
+                
+                # Create private transfer
+                ok, result = await create_private_transfer(target_addr, 0.1)
+                log_info(f"Auto private transfer: transfer result - ok: {ok}, result: {result}")
+                
+                if ok:
+                    auto_stats['private_transfer']['count'] += 1
+                    auto_stats['private_transfer']['last'] = datetime.now()
+                    auto_stats['private_transfer']['next_idx'] = (auto_stats['private_transfer']['next_idx'] + 1) % len(auto_addresses)
+                    log_info(f"Auto private transfer: successful transfer to {target_addr}, count: {auto_stats['private_transfer']['count']}")
+                else:
+                    # Check if it's a duplicate transaction error
+                    if result and is_duplicate_transaction_error(result.get('error', '')):
+                        log_info(f"Auto private transfer: skipped duplicate transaction to {target_addr}")
+                        # Don't count duplicates as errors
+                    else:
+                        auto_stats['private_transfer']['errors'] += 1
+                        log_error("auto_private_transfer", Exception(f"Transfer failed: {result}"), f"Failed to transfer to {target_addr}")
+                    
+                # Always wait 5 minutes before next attempt
+                log_info("Auto private transfer: waiting 5 minutes before next attempt")
+                await asyncio.sleep(300)
+                    
+            except Exception as e:
+                auto_stats['private_transfer']['errors'] += 1
+                log_error("auto_private_transfer", e, f"Exception occurred: {str(e)}")
+                # Wait 5 minutes before retrying
+                await asyncio.sleep(300)
+    except asyncio.CancelledError:
+        log_info("Auto private transfer cancelled")
+    except Exception as e:
+        log_error(f"Auto private transfer: critical error: {str(e)}")
+    finally:
+        log_info("Auto private transfer stopped")
+
+async def auto_encrypt_decrypt():
+    """Encrypt 0.1 token every minute, decrypt the next minute"""
+    log_info("Auto encrypt/decrypt started")
+    try:
+        encrypt_next = True
+        while not auto_stop_flag.is_set():
+            try:
+                if encrypt_next:
+                    # Encrypt balance
+                    log_info("Auto encrypt/decrypt: attempting to encrypt 0.1 tokens")
+                    enc_data = await get_encrypted_balance()
+                    log_info(f"Auto encrypt: retrieved balance data: {enc_data}")
+                    if enc_data and enc_data['public'] >= 1.1:  # Need extra for fees
+                        ok, result = await encrypt_balance(0.1)
+                        log_info(f"Auto encrypt: encryption result - ok: {ok}, result: {result}")
+                        if ok:
+                            auto_stats['encrypt_balance']['count'] += 1
+                            auto_stats['encrypt_balance']['last'] = datetime.now()
+                            log_info(f"Auto encrypt: successful encryption, count: {auto_stats['encrypt_balance']['count']}")
+                        else:
+                            # Check if it's a duplicate transaction error
+                            if result and is_duplicate_transaction_error(result.get('error', '')):
+                                log_info(f"Auto encrypt: skipped duplicate transaction")
+                                # Don't count duplicates as errors
+                            else:
+                                auto_stats['encrypt_balance']['errors'] += 1
+                                log_error("auto_encrypt_decrypt", Exception(f"Encryption failed: {result}"), "Failed to encrypt balance")
+                    else:
+                        # Don't count insufficient balance as an error
+                        public_balance = enc_data['public'] if enc_data else 'N/A'
+                        log_warning(f"Auto encrypt: insufficient public balance ({public_balance}), need at least 1.1")
+                else:
+                    # Decrypt balance
+                    log_info("Auto encrypt/decrypt: attempting to decrypt 0.1 tokens")
+                    enc_data = await get_encrypted_balance()
+                    log_info(f"Auto decrypt: retrieved balance data: {enc_data}")
+                    if enc_data and enc_data['encrypted'] >= 0.1:
+                        ok, result = await decrypt_balance(0.1)
+                        log_info(f"Auto decrypt: decryption result - ok: {ok}, result: {result}")
+                        if ok:
+                            auto_stats['decrypt_balance']['count'] += 1
+                            auto_stats['decrypt_balance']['last'] = datetime.now()
+                            log_info(f"Auto decrypt: successful decryption, count: {auto_stats['decrypt_balance']['count']}")
+                        else:
+                            # Check if it's a duplicate transaction error
+                            if result and is_duplicate_transaction_error(result.get('error', '')):
+                                log_info(f"Auto decrypt: skipped duplicate transaction")
+                                # Don't count duplicates as errors
+                            else:
+                                auto_stats['decrypt_balance']['errors'] += 1
+                                log_error("auto_encrypt_decrypt", Exception(f"Decryption failed: {result}"), "Failed to decrypt balance")
+                    else:
+                        # Don't count insufficient balance as an error
+                        encrypted_balance = enc_data['encrypted'] if enc_data else 'N/A'
+                        log_warning(f"Auto decrypt: insufficient encrypted balance ({encrypted_balance}), need at least 0.1")
+                
+                encrypt_next = not encrypt_next
+                log_info("Auto encrypt/decrypt: waiting 60 seconds before next attempt")
+                await asyncio.sleep(60)
+                    
+            except Exception as e:
+                if encrypt_next:
+                    auto_stats['encrypt_balance']['errors'] += 1
+                    log_error("auto_encrypt_decrypt", e, f"Exception in encrypt: {str(e)}")
+                else:
+                    auto_stats['decrypt_balance']['errors'] += 1
+                    log_error("auto_encrypt_decrypt", e, f"Exception in decrypt: {str(e)}")
+                await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        log_info("Auto encrypt/decrypt cancelled")
+    except Exception as e:
+        log_error(f"Auto encrypt/decrypt: critical error: {str(e)}")
+    finally:
+        log_info("Auto encrypt/decrypt stopped")
+
+async def auto_claim():
+    """Auto claim private transfers when available"""
+    log_info("Auto claim started")
+    try:
+        while not auto_stop_flag.is_set():
+            try:
+                transfers = await get_pending_transfers()
+                
+                if transfers:
+                    log_info(f"Auto claim: found {len(transfers)} pending transfers")
+                else:
+                    log_info("Auto claim: no pending transfers found")
+                
+                for transfer in transfers:
+                    try:
+                        transfer_id = transfer['id']
+                        log_info(f"Auto claim: attempting to claim transfer {transfer_id}")
+                        ok, result = await claim_private_transfer(transfer_id)
+                        
+                        if ok:
+                            auto_stats['auto_claim']['count'] += 1
+                            auto_stats['auto_claim']['last'] = datetime.now()
+                            log_info(f"Auto claim: successfully claimed transfer {transfer_id}, count: {auto_stats['auto_claim']['count']}")
+                        else:
+                            auto_stats['auto_claim']['errors'] += 1
+                            log_error(f"Auto claim: failed to claim transfer {transfer_id}, result: {result}")
+                            
+                        # Small delay between claims
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        auto_stats['auto_claim']['errors'] += 1
+                        log_error(f"Auto claim: exception while claiming transfer {transfer.get('id', 'unknown')}: {str(e)}")
+                        
+            except Exception as e:
+                auto_stats['auto_claim']['errors'] += 1
+                log_error(f"Auto claim: exception while getting pending transfers: {str(e)}")
+            
+            # Check for new transfers every 30 seconds
+            await asyncio.sleep(30)
+    except asyncio.CancelledError:
+        log_info("Auto claim cancelled")
+    except Exception as e:
+        log_error(f"Auto claim: critical error: {str(e)}")
+    finally:
+        log_info("Auto claim stopped")
+
+async def start_auto_mode():
+    """Start all auto mode tasks"""
+    global auto_tasks, auto_mode
+    if auto_mode:
+        log_info("Auto mode already running")
+        return
+    
+    try:
+        log_info("Starting auto mode...")
+        print("Starting auto mode...")
+        auto_mode = True
+        auto_stop_flag.clear()
+        
+        # Reset statistics for a fresh start
+        reset_auto_stats()
+        
+        # Create individual tasks and store them separately
+        auto_tasks = []
+        task_names = ['send_tx', 'multi_send', 'private_transfer', 'encrypt_decrypt', 'claim']
+        task_functions = [auto_send_tx, auto_multi_send, auto_private_transfer, auto_encrypt_decrypt, auto_claim]
+        
+        for name, func in zip(task_names, task_functions):
+            try:
+                log_info(f"Starting auto {name} task")
+                task = asyncio.create_task(func())
+                task.set_name(f"auto_{name}")
+                auto_tasks.append(task)
+                print(f"✓ Started auto {name}")
+                log_info(f"Successfully started auto {name}")
+            except Exception as e:
+                error_msg = f"Failed to start auto {name}: {e}"
+                print(f"✗ {error_msg}")
+                log_error(f"start_auto_mode", e, f"Failed to start {name}")
+        
+        if auto_tasks:
+            success_msg = f"Auto mode started with {len(auto_tasks)} active tasks"
+            print(f"✓ {success_msg}")
+            log_info(success_msg)
+        else:
+            auto_mode = False
+            error_msg = "No auto tasks could be started"
+            print(f"✗ {error_msg}")
+            log_error("start_auto_mode", Exception(error_msg), "No tasks started")
+            
+    except Exception as e:
+        auto_mode = False
+        error_msg = f"Auto mode startup failed: {e}"
+        print(f"✗ {error_msg}")
+        log_error("start_auto_mode", e, "Startup failed")
+        raise e
+
+async def stop_auto_mode():
+    """Stop auto mode"""
+    global auto_tasks, auto_mode
+    if not auto_mode:
+        return
+    
+    try:
+        print("Stopping auto mode...")
+        log_info("Stopping auto mode...")
+        auto_mode = False
+        auto_stop_flag.set()
+        
+        if auto_tasks:
+            # Cancel all auto tasks
+            for task in auto_tasks:
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for all tasks to finish
+            await asyncio.gather(*auto_tasks, return_exceptions=True)
+            auto_tasks.clear()
+        
+        print("✓ Auto mode stopped")
+        log_info("Auto mode stopped successfully")
+        
+    except Exception as e:
+        print(f"✗ Error stopping auto mode: {e}")
+        log_error("stop_auto_mode", e, "Error during shutdown")
+        # Force reset even if there was an error
+        auto_mode = False
+        if auto_tasks:
+            auto_tasks.clear()
+
+async def auto_status():
+    """Show detailed auto mode status"""
+    cr = sz()
+    cls()
+    fill()
+    w, hb = 85, cr[1] - 4
+    x = (cr[0] - w) // 2
+    y = 2
+    
+    box(x, y, w, hb, "auto mode status")
+    
+    if not auto_mode:
+        at(x + 2, y + 10, "auto mode is not running", c['R'])
+        at(x + 2, y + 12, "press [a] to start auto mode", c['y'])
+        await awaitkey()
+        return
+    
+    at(x + 2, y + 2, "AUTO MODE ACTIVE", c['bgg'] + c['w'])
+    at(x + 2, y + 4, "TARGET ADDRESSES:", c['B'] + c['c'])
+    
+    for i, addr in enumerate(auto_addresses):
+        at(x + 4, y + 5 + i, f"[{i+1}] {addr}", c['w'])
+    
+    at(x + 2, y + 11, "ACTIVITY STATUS:", c['B'] + c['c'])
+    
+    # Send TX status
+    at(x + 4, y + 13, "Send TX (every 1 min):", c['c'])
+    at(x + 26, y + 13, f"count: {auto_stats['send_tx']['count']}", c['g'])
+    at(x + 40, y + 13, f"errors: {auto_stats['send_tx']['errors']}", c['R'] if auto_stats['send_tx']['errors'] > 0 else c['w'])
+    at(x + 55, y + 13, f"last: {format_time_ago(auto_stats['send_tx']['last'])}", c['y'])
+    
+    # Multi send status
+    at(x + 4, y + 14, "Multi Send (every 5 min):", c['c'])
+    at(x + 26, y + 14, f"count: {auto_stats['multi_send']['count']}", c['g'])
+    at(x + 40, y + 14, f"errors: {auto_stats['multi_send']['errors']}", c['R'] if auto_stats['multi_send']['errors'] > 0 else c['w'])
+    at(x + 55, y + 14, f"last: {format_time_ago(auto_stats['multi_send']['last'])}", c['y'])
+    
+    # Private transfer status
+    at(x + 4, y + 15, "Private Transfer (every 5 min):", c['c'])
+    at(x + 26, y + 15, f"count: {auto_stats['private_transfer']['count']}", c['g'])
+    at(x + 40, y + 15, f"errors: {auto_stats['private_transfer']['errors']}", c['R'] if auto_stats['private_transfer']['errors'] > 0 else c['w'])
+    at(x + 55, y + 15, f"last: {format_time_ago(auto_stats['private_transfer']['last'])}", c['y'])
+    
+    # Encrypt/Decrypt status
+    at(x + 4, y + 16, "Encrypt Balance (every 1 min):", c['c'])
+    at(x + 26, y + 16, f"count: {auto_stats['encrypt_balance']['count']}", c['g'])
+    at(x + 40, y + 16, f"errors: {auto_stats['encrypt_balance']['errors']}", c['R'] if auto_stats['encrypt_balance']['errors'] > 0 else c['w'])
+    at(x + 55, y + 16, f"last: {format_time_ago(auto_stats['encrypt_balance']['last'])}", c['y'])
+    
+    at(x + 4, y + 17, "Decrypt Balance (every 1 min):", c['c'])
+    at(x + 26, y + 17, f"count: {auto_stats['decrypt_balance']['count']}", c['g'])
+    at(x + 40, y + 17, f"errors: {auto_stats['decrypt_balance']['errors']}", c['R'] if auto_stats['decrypt_balance']['errors'] > 0 else c['w'])
+    at(x + 55, y + 17, f"last: {format_time_ago(auto_stats['decrypt_balance']['last'])}", c['y'])
+    
+    # Auto claim status
+    at(x + 4, y + 18, "Auto Claim (continuous):", c['c'])
+    at(x + 26, y + 18, f"count: {auto_stats['auto_claim']['count']}", c['g'])
+    at(x + 40, y + 18, f"errors: {auto_stats['auto_claim']['errors']}", c['R'] if auto_stats['auto_claim']['errors'] > 0 else c['w'])
+    at(x + 55, y + 18, f"last: {format_time_ago(auto_stats['auto_claim']['last'])}", c['y'])
+    
+    # Next actions
+    at(x + 2, y + 20, "NEXT ACTIONS:", c['B'] + c['c'])
+    at(x + 4, y + 21, f"Send TX: {format_next_action(auto_stats['send_tx']['last'], 60)}", c['y'])
+    at(x + 30, y + 21, f"Multi Send: {format_next_action(auto_stats['multi_send']['last'], 300)}", c['y'])
+    at(x + 60, y + 21, f"Private: {format_next_action(auto_stats['private_transfer']['last'], 300)}", c['y'])
+    
+    await awaitkey()
+
 def signal_handler(sig, frame):
     stop_flag.set()
+    auto_stop_flag.set()  # Also stop auto mode
     if session:
         asyncio.create_task(session.close())
     sys.exit(0)
@@ -1232,15 +1938,29 @@ def signal_handler(sig, frame):
 async def main():
     global session
     
+    log_info("=== OCTRA CLI STARTING ===")
+    log_info(f"Timestamp: {datetime.now()}")
+    
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     if not ld():
+        log_error("main", Exception("Wallet loading failed"), "wallet.json error")
         sys.exit("[!] wallet.json error")
     if not addr:
+        log_error("main", Exception("No address configured"), "wallet.json not configured")
         sys.exit("[!] wallet.json not configured")
     
+    log_info(f"Wallet loaded successfully. Address: {addr}")
+    log_info(f"RPC endpoint: {rpc}")
+    
+    # Show user where logs are being written
+    log_filename = f"octra_auto_mode_{datetime.now().strftime('%Y%m%d')}.log"
+    print(f"🔧 Debug logging enabled: {log_filename}")
+    print("📝 Auto mode errors and activity will be logged to this file")
+    
     try:
+        log_info("Fetching initial balance and history...")
         await st()
         await gh()
         
@@ -1269,14 +1989,54 @@ async def main():
             elif cmd == '9':
                 h.clear()
                 lh = 0
+            elif cmd in ['a', 'A']:
+                try:
+                    log_info(f"User pressed 'a' to toggle auto mode. Current state: {auto_mode}")
+                    if auto_mode:
+                        await stop_auto_mode()
+                    else:
+                        await start_auto_mode()
+                except Exception as e:
+                    # Show error and continue instead of crashing
+                    error_msg = f"Auto mode error: {str(e)}"
+                    print(f"\033[41m\033[37m{error_msg}\033[0m")
+                    log_error("main_auto_toggle", e, "User pressed 'a' to toggle auto mode")
+                    print("Check octra_auto_mode_*.log for detailed error information")
+                    await asyncio.sleep(5)  # Give more time to read the error
+            elif cmd in ['s', 'S']:
+                try:
+                    log_info("User pressed 's' to view auto status")
+                    await auto_status()
+                except Exception as e:
+                    error_msg = f"Status error: {str(e)}"
+                    print(f"\033[41m\033[37m{error_msg}\033[0m")
+                    log_error("main_auto_status", e, "User pressed 's' to view status")
+                    await asyncio.sleep(3)
             elif cmd in ['0', 'q', '']:
+                log_info("User requested exit")
                 break
-    except Exception:
-        pass
+    except KeyboardInterrupt:
+        # Handle Ctrl+C gracefully
+        log_info("Application interrupted by user (Ctrl+C)")
+    except Exception as e:
+        # Show the actual error for debugging
+        print(f"\033[41m\033[37mError: {str(e)}\033[0m")
+        log_error("main", e, "Fatal error in main loop")
+        await asyncio.sleep(3)
     finally:
+        log_info("=== CLEANUP STARTING ===")
+        # Stop auto mode if running
+        if auto_mode:
+            log_info("Stopping auto mode during cleanup")
+            await stop_auto_mode()
+        
         if session:
+            log_info("Closing HTTP session")
             await session.close()
+        
+        log_info("Shutting down executor")
         executor.shutdown(wait=False)
+        log_info("=== OCTRA CLI SHUTDOWN COMPLETE ===")
 
 if __name__ == "__main__":
     import warnings

@@ -1,5 +1,5 @@
 wallet.json
-automation_state.json
+*.log
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
