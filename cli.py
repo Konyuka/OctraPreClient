@@ -65,8 +65,10 @@ def inp(x, y):
 async def ainp(x, y):
     print(f"\033[{y};{x}H", end='', flush=True)
     try:
+        # Block indefinitely without timeout to prevent unwanted CLI shutdowns
         return await asyncio.get_event_loop().run_in_executor(executor, input)
-    except:
+    except Exception as e:
+        log_error("ainp", e, "Error in async input")
         stop_flag.set()
         return ''
 
@@ -89,8 +91,10 @@ async def awaitkey():
     at(x_pos, y_pos, msg, c['y'])
     print(f"\033[{y_pos};{x_pos + msg_len}H{c['bg']}", end='', flush=True)
     try:
+        # Block indefinitely without timeout to prevent unwanted CLI shutdowns
         await asyncio.get_event_loop().run_in_executor(executor, input)
-    except:
+    except Exception as e:
+        log_error("awaitkey", e, "Error waiting for user input")
         stop_flag.set()
 
 def ld():
@@ -289,21 +293,51 @@ async def req(m, p, d=None, t=10):
         if m == 'POST' and d:
             kwargs['json'] = d
         
+        log_info(f"Making {m} request to {url}")
         async with getattr(session, m.lower())(url, **kwargs) as resp:
-            text = await resp.text()
+            try:
+                # Try to read as UTF-8 first
+                text = await resp.text(encoding='utf-8')
+            except UnicodeDecodeError:
+                # If UTF-8 fails, try with error handling
+                try:
+                    text = await resp.text(encoding='utf-8', errors='replace')
+                    log_warning(f"Request {m} {url} had encoding issues, using replacement characters")
+                except:
+                    # As a last resort, read as bytes and decode with error handling
+                    raw_bytes = await resp.read()
+                    text = raw_bytes.decode('utf-8', errors='replace')
+                    log_warning(f"Request {m} {url} had severe encoding issues, forced decode")
             
             try:
                 j = json.loads(text) if text.strip() else None
-            except:
+            except json.JSONDecodeError as e:
+                log_warning(f"Request {m} {url} returned invalid JSON: {str(e)}")
+                j = None
+            except Exception as e:
+                log_warning(f"Request {m} {url} JSON parsing error: {str(e)}")
                 j = None
             
+            log_info(f"Request {m} {url} completed with status {resp.status}")
             return resp.status, text, j
     except asyncio.TimeoutError:
+        log_warning(f"Request {m} {url} timed out after {t}s")
         return 0, "timeout", None
     except Exception as e:
+        log_error("req", e, f"Request {m} {url} failed")
         return 0, str(e), None
 
 async def req_private(path, method='GET', data=None):
+    global session
+    if not session:
+        ssl_context = ssl.create_default_context()
+        connector = aiohttp.TCPConnector(ssl=ssl_context, force_close=True)
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10),
+            connector=connector,
+            json_serialize=json.dumps
+        )
+    
     headers = {"X-Private-Key": priv}
     try:
         url = f"{rpc}{path}"
@@ -312,18 +346,38 @@ async def req_private(path, method='GET', data=None):
         if method == 'POST' and data:
             kwargs['json'] = data
             
+        log_info(f"Making private {method} request to {url}")
         async with getattr(session, method.lower())(url, **kwargs) as resp:
-            text = await resp.text()
+            try:
+                # Try to read as UTF-8 first
+                text = await resp.text(encoding='utf-8')
+            except UnicodeDecodeError:
+                # If UTF-8 fails, try with error handling
+                try:
+                    text = await resp.text(encoding='utf-8', errors='replace')
+                    log_warning(f"Private request {method} {url} had encoding issues")
+                except:
+                    # As a last resort, read as bytes and decode with error handling
+                    raw_bytes = await resp.read()
+                    text = raw_bytes.decode('utf-8', errors='replace')
+                    log_warning(f"Private request {method} {url} had severe encoding issues")
             
             if resp.status == 200:
                 try:
+                    log_info(f"Private request {method} {url} completed successfully")
                     return True, json.loads(text) if text.strip() else {}
-                except:
+                except json.JSONDecodeError as e:
+                    log_warning(f"Private request {method} {url} returned invalid JSON: {str(e)}")
                     return False, {"error": "Invalid JSON response"}
+                except Exception as e:
+                    log_warning(f"Private request {method} {url} JSON parsing error: {str(e)}")
+                    return False, {"error": "JSON parsing error"}
             else:
+                log_warning(f"Private request {method} {url} returned status {resp.status}")
                 return False, {"error": f"HTTP {resp.status}"}
                 
     except Exception as e:
+        log_error("req_private", e, f"Private request {method} {url} failed")
         return False, {"error": str(e)}
 
 async def st():
@@ -339,7 +393,13 @@ async def st():
     )
     
     s, t, j = results[0] if not isinstance(results[0], Exception) else (0, str(results[0]), None)
-    s2, _, j2 = results[1] if not isinstance(results[1], Exception) else (0, None, None)
+    s2, t2, j2 = results[1] if not isinstance(results[1], Exception) else (0, str(results[1]), None)
+    
+    # Log staging request issues
+    if isinstance(results[1], Exception):
+        log_warning(f"Staging request failed with exception: {str(results[1])}")
+    elif s2 != 200:
+        log_warning(f"Staging request returned status {s2}: {t2}")
     
     if s == 200 and j:
         cn = int(j.get('nonce', 0))
@@ -598,20 +658,44 @@ async def expl(x, y, w, hb):
     at(x + 11, y + 5, pub[:40] + "...", c['w'])
     
     try:
-        enc_data = await get_encrypted_balance()
+        # Add timeout to prevent hanging
+        enc_data = await asyncio.wait_for(get_encrypted_balance(), timeout=5.0)
         if enc_data:
             at(x + 2, y + 6, "encrypted:", c['c'])
             at(x + 13, y + 6, f"{enc_data['encrypted']:.6f} oct", c['B'] + c['y'])
             
-            pending = await get_pending_transfers()
-            if pending:
-                at(x + 2, y + 7, "claimable:", c['c'])
-                at(x + 13, y + 7, f"{len(pending)} transfers", c['B'] + c['g'])
-    except:
-        pass
+            try:
+                # Add timeout for pending transfers check
+                pending = await asyncio.wait_for(get_pending_transfers(), timeout=5.0)
+                if pending:
+                    at(x + 2, y + 7, "claimable:", c['c'])
+                    at(x + 13, y + 7, f"{len(pending)} transfers", c['B'] + c['g'])
+            except asyncio.TimeoutError:
+                log_warning("Timeout getting pending transfers")
+    except asyncio.TimeoutError:
+        log_warning("Timeout getting encrypted balance")
+    except Exception as e:
+        log_warning(f"Error getting encrypted balance: {str(e)}")
     
-    _, _, j = await req('GET', '/staging', 2)
-    sc = len([tx for tx in j.get('staged_transactions', []) if tx.get('from') == addr]) if j else 0
+    try:
+        # Add timeout for staging request with better error handling
+        staging_result = await asyncio.wait_for(req('GET', '/staging', 2), timeout=3.0)
+        if staging_result and staging_result[0] == 200 and staging_result[2]:
+            j = staging_result[2]
+            sc = len([tx for tx in j.get('staged_transactions', []) if tx.get('from') == addr])
+        else:
+            log_warning(f"Staging request failed: status={staging_result[0] if staging_result else 'None'}")
+            sc = 0
+    except asyncio.TimeoutError:
+        log_warning("Timeout getting staging info")
+        sc = 0
+    except UnicodeDecodeError as e:
+        log_warning(f"Staging request encoding error: {str(e)}")
+        sc = 0
+    except Exception as e:
+        log_warning(f"Staging request error: {str(e)}")
+        sc = 0
+        
     at(x + 2, y + 8, "staging:", c['c'])
     at(x + 11, y + 8, f"{sc} pending" if sc else "none", c['y'] if sc else c['w'])
     at(x + 1, y + 9, "─" * (w - 2), c['w'])
@@ -718,7 +802,20 @@ async def scr():
     
     explorer_x = sidebar_w + 4
     explorer_w = cr[0] - explorer_x - 2
-    await expl(explorer_x, 3, explorer_w, cr[1] - 6)
+    
+    try:
+        # Add timeout to prevent hanging on explorer section
+        await asyncio.wait_for(expl(explorer_x, 3, explorer_w, cr[1] - 6), timeout=15.0)
+    except asyncio.TimeoutError:
+        log_warning("Explorer section timed out, continuing...")
+        # Show error message in explorer area
+        box(explorer_x, 3, explorer_w, cr[1] - 6, "wallet explorer (timeout)")
+        at(explorer_x + 2, 5, "Network timeout - try refreshing", c['R'])
+    except Exception as e:
+        log_error("expl", e, "Error in explorer section")
+        # Show error message in explorer area
+        box(explorer_x, 3, explorer_w, cr[1] - 6, "wallet explorer (error)")
+        at(explorer_x + 2, 5, f"Error: {str(e)[:50]}", c['R'])
     
     at(2, cr[1] - 1, " " * (cr[0] - 4), c['bg'])
     at(2, cr[1] - 1, "ready", c['bgg'] + c['w'])
@@ -1962,19 +2059,25 @@ async def main():
     
     log_info("=== OCTRA CLI STARTING ===")
     log_info(f"Timestamp: {datetime.now()}")
+    print(f"{c['g']}Starting OCTRA CLI...{c['r']}")
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    print(f"{c['c']}Loading wallet...{c['r']}")
     if not ld():
         log_error("main", Exception("Wallet loading failed"), "wallet.json error")
+        print(f"{c['R']}[!] wallet.json error{c['r']}")
         sys.exit("[!] wallet.json error")
     if not addr:
         log_error("main", Exception("No address configured"), "wallet.json not configured")
+        print(f"{c['R']}[!] wallet.json not configured{c['r']}")
         sys.exit("[!] wallet.json not configured")
     
     log_info(f"Wallet loaded successfully. Address: {addr}")
     log_info(f"RPC endpoint: {rpc}")
+    print(f"{c['g']}✓ Wallet loaded: {addr}{c['r']}")
+    print(f"{c['c']}✓ RPC: {rpc}{c['r']}")
     
     # Show user where logs are being written
     log_filename = f"octra_auto_mode_{datetime.now().strftime('%Y%m%d')}.log"
@@ -1983,11 +2086,38 @@ async def main():
     
     try:
         log_info("Fetching initial balance and history...")
-        await st()
-        await gh()
+        print(f"{c['c']}Fetching balance and history...{c['r']}")
+        try:
+            await st()
+            log_info("Balance fetched successfully")
+            print(f"{c['g']}✓ Balance fetched{c['r']}")
+        except Exception as e:
+            log_error("initialization", e, "Failed to fetch balance")
+            print(f"{c['R']}Failed to fetch balance: {str(e)}{c['r']}")
+            await asyncio.sleep(3)
+        
+        try:
+            await gh()
+            log_info("Transaction history fetched successfully")
+            print(f"{c['g']}✓ History fetched{c['r']}")
+        except Exception as e:
+            log_error("initialization", e, "Failed to fetch transaction history")
+            print(f"{c['R']}Failed to fetch transaction history: {str(e)}{c['r']}")
+            await asyncio.sleep(3)
+        
+        log_info("Initialization completed, starting main loop")
+        print(f"{c['g']}✓ Initialization complete{c['r']}")
+        print(f"{c['B']}Starting main interface...{c['r']}")
         
         while not stop_flag.is_set():
-            cmd = await scr()
+            try:
+                cmd = await scr()
+                log_info(f"User input received: '{cmd}'")
+            except Exception as e:
+                log_error("main_loop", e, "Error in screen/input handling")
+                print(f"{c['R']}Screen/input error: {str(e)}{c['r']}")
+                await asyncio.sleep(2)
+                continue
             
             if cmd == '1':
                 await tx()
