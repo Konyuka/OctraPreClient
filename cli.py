@@ -1569,14 +1569,16 @@ async def send_with_retry(target_addr, amount, tx_type, max_retries=3):
 
 # Auto mode functions
 async def auto_send_tx():
-    """Send 0.01 token to addresses in round robin every minute"""
+    """Send 0.01 token to addresses in round robin every minute - limited to 2 executions"""
     log_info("Auto Send TX task started")
-    # Start immediately (no delay)
+    max_executions = 2
+    execution_count = 0
+    
     try:
-        while not auto_stop_flag.is_set():
+        while not auto_stop_flag.is_set() and execution_count < max_executions:
             try:
                 target_addr = auto_addresses[auto_stats['send_tx']['next_idx']]
-                log_info(f"Auto Send TX: Attempting to send 0.01 to {target_addr}")
+                log_info(f"Auto Send TX: Attempting to send 0.01 to {target_addr} (execution {execution_count + 1}/{max_executions})")
                 
                 # Check balance first
                 _, b = await st()
@@ -1605,6 +1607,11 @@ async def auto_send_tx():
                         'ok': True,
                         'msg': 'auto_send'
                     })
+                    
+                    # Increment execution count only on successful send
+                    execution_count += 1
+                    log_info(f"Auto Send TX: Completed execution {execution_count}/{max_executions}")
+                    
                 else:
                     auto_stats['send_tx']['errors'] += 1
                     # Only log as error if it's not a duplicate transaction that we're skipping
@@ -1617,23 +1624,35 @@ async def auto_send_tx():
                 auto_stats['send_tx']['errors'] += 1
                 log_error("auto_send_tx", e, f"Exception in send loop for {target_addr}")
             
-            # Wait 60 seconds
-            await asyncio.sleep(60)
+            # Only wait if we haven't reached the limit
+            if execution_count < max_executions:
+                await asyncio.sleep(60)
+        
+        # Log completion
+        if execution_count >= max_executions:
+            log_info(f"Auto Send TX: Completed all {max_executions} executions, stopping")
+        else:
+            log_info("Auto Send TX: Stopped before completing all executions")
+            
     except asyncio.CancelledError:
-        log_info("Auto Send TX task cancelled")
+        log_info(f"Auto Send TX task cancelled after {execution_count}/{max_executions} executions")
     except Exception as e:
         log_error("auto_send_tx", e, "Fatal error in auto_send_tx")
 
 async def auto_multi_send():
-    """Multi send 0.01 token to all addresses every 5 minutes"""
+    """Multi send 0.01 token to all addresses every 5 minutes - limited to 1 execution"""
     log_info("Auto Multi Send task started")
+    max_executions = 1
+    execution_count = 0
+    
     # Wait 10 seconds before starting to stagger with auto_send_tx
     await asyncio.sleep(10)
     log_info("Auto Multi Send: Starting after 10s delay")
+    
     try:
-        while not auto_stop_flag.is_set():
+        while not auto_stop_flag.is_set() and execution_count < max_executions:
             try:
-                log_info("Auto Multi Send: Starting cycle - sending 0.01 to all addresses")
+                log_info(f"Auto Multi Send: Starting cycle - sending 0.01 to all addresses (execution {execution_count + 1}/{max_executions})")
                 
                 # Check balance first - we need at least 0.01 * number of addresses
                 _, b = await st()
@@ -1685,23 +1704,34 @@ async def auto_multi_send():
                         all_success = False
                         log_error("auto_multi_send", e, f"Exception sending to {target_addr}")
                 
-                # Update stats based on overall cycle success
+                # Update stats and increment execution count
+                execution_count += 1
+                
                 if all_success:
                     auto_stats['multi_send']['count'] += 1
                     auto_stats['multi_send']['last'] = datetime.now()
-                    log_info(f"Auto Multi Send: Cycle completed successfully - sent to all {len(auto_addresses)} addresses")
+                    log_info(f"Auto Multi Send: Cycle {execution_count}/{max_executions} completed successfully - sent to all {len(auto_addresses)} addresses")
                 else:
                     auto_stats['multi_send']['errors'] += 1
-                    log_error("auto_multi_send", Exception("Partial cycle failure"), f"Cycle completed with errors - {successful_sends}/{len(auto_addresses)} successful")
+                    log_error("auto_multi_send", Exception("Partial cycle failure"), f"Cycle {execution_count}/{max_executions} completed with errors - {successful_sends}/{len(auto_addresses)} successful")
                     
             except Exception as e:
                 auto_stats['multi_send']['errors'] += 1
                 log_error("auto_multi_send", e, "Exception in multi send cycle")
+                execution_count += 1  # Still count as an execution even if it failed
             
-            # Wait 5 minutes
-            await asyncio.sleep(300)
+            # Only wait if we haven't reached the limit
+            if execution_count < max_executions:
+                await asyncio.sleep(300)  # 5 minutes
+        
+        # Log completion
+        if execution_count >= max_executions:
+            log_info(f"Auto Multi Send: Completed all {max_executions} executions, stopping")
+        else:
+            log_info("Auto Multi Send: Stopped before completing all executions")
+            
     except asyncio.CancelledError:
-        log_info("Auto Multi Send task cancelled")
+        log_info(f"Auto Multi Send task cancelled after {execution_count}/{max_executions} executions")
     except Exception as e:
         log_error("auto_multi_send", e, "Fatal error in auto_multi_send")
 
@@ -1759,7 +1789,7 @@ async def auto_private_transfer():
                 await asyncio.sleep(300)
                     
             except Exception as e:
-                auto_stats['private_transfer']['errors'] += 1
+                auto_stats['auto_claim']['errors'] += 1
                 log_error("auto_private_transfer", e, f"Exception occurred: {str(e)}")
                 # Wait 5 minutes before retrying
                 await asyncio.sleep(300)
